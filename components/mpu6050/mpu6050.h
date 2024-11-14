@@ -10,7 +10,7 @@
 #include <math.h>
 
 #define I2C_MASTER_FREQ_HZ 400000
-#define GYRO_LSB_SENSITIVITY 131.0
+#define GYRO_LSB_SENSITIVITY 131000000.0 // 131 (from datasheet) * 1000000 (microsend per second)
 #define MPU6050_CALIBRATION_SAMPLE_SIZE 2000
 #define I2C_SDA_PIN GPIO_NUM_21
 #define I2C_SCL_PIN GPIO_NUM_22

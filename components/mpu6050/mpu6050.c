@@ -20,7 +20,9 @@ int16_t get_GyroZ_raw(){
     uint8_t data = MPU6050_GYRO_ZOUT_H;
     uint8_t gyroZ_raw[2] = {0};
     // ESP_LOGI(TAG, "Triggered MOU6050");
-    i2c_master_transmit_receive(mpu6050_handle, &data, sizeof(data), gyroZ_raw, sizeof(gyroZ_raw), 30);
+    if( i2c_master_transmit_receive(mpu6050_handle, &data, sizeof(data), gyroZ_raw, sizeof(gyroZ_raw), 30) != ESP_OK){
+        return 0;
+    }
     int16_t gyroZ_signed = ((gyroZ_raw[0] << 8) | gyroZ_raw[1]);
     // float gyroZ = (float)gyroZ_signed / GYRO_LSB_SENSITIVITY;
     // ESP_LOGI(TAG, "%f", gyroZ);
@@ -48,7 +50,7 @@ void print_debug_mpu6050(void *arg){
 // Used void pointer to make it compatible for esp timer callback function
 void mpu6050_updateZ(float* angleZ, int64_t dt){
     int16_t gyroZ = get_GyroZ_raw(mpu6050_handle);
-    temp = (((float)gyroZ/GYRO_LSB_SENSITIVITY) - calibrationZ)* (float)dt / 1000000.0;
+    temp = ((float)gyroZ - calibrationZ)/GYRO_LSB_SENSITIVITY* (float)dt;
     // if (temp < 0.07 && temp >- 0.07){
     //     temp = 0;
     // }
@@ -96,7 +98,7 @@ void mpu6050_init(){
         int16_t gyroZ = get_GyroZ_raw(mpu6050_handle); 
         calibrationZ += (float)gyroZ;
     }
-    calibrationZ = (calibrationZ/MPU6050_CALIBRATION_SAMPLE_SIZE)/GYRO_LSB_SENSITIVITY;    
+    calibrationZ = (calibrationZ/MPU6050_CALIBRATION_SAMPLE_SIZE);
     ESP_LOGI(TAG, "%f", calibrationZ);
     ESP_LOGI(TAG, "MPU6050 Calibration Done");
     prevtime = esp_timer_get_time();

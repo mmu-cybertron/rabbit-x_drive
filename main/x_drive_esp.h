@@ -125,6 +125,5 @@ void print_debug(void *arg);
 // Private Functions
 void initialize_pid_controller(pid_controller_t *pid_params, mcpwm_cmpr_handle_t motor, pcnt_unit_handle_t encoder, float target_speed, float kp, float ki, float kd, float integral_limit_max, float integral_limit_min);
 void update_PID_output(void *arg);
-void cb (void *arg, ps5_t ps5, ps5_event_t event);
 
 #endif
