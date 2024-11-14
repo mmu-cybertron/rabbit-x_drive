@@ -24,8 +24,8 @@
 
 const float comparator_per_ps5 = MAXIMUM_SPEED_COMPARATOR / MAXIMUM_MAG_PS5;
 
-#define MPU_6050_KP 50
-#define MPU_6050_KI 0.01
+#define MPU_6050_KP 50 //50
+#define MPU_6050_KI 0.01 //0.01
 #define MPU_6050_KD 0
 #define MPU_6050_INTEGRAL_LIMIT_MAX 500
 #define MPU_6050_INTEGRAL_LIMIT_MIN -500
@@ -39,12 +39,25 @@ const float phase_shift = 3*3.14159/4;
 
 #define EDGE_BUTTON_PIN GPIO_NUM_27
 
+#define SHOOTER_MOTOR_UP_PWM GPIO_NUM_4
+#define SHOOTER_MOTOR_DOWN_PWM GPIO_NUM_23
+
+#define SHOOTER_TIMER_GROUP 1
+
+#define SHOOTER_CLICK_STEP 50
+
+#define PNEUMATIC_PIN GPIO_NUM_26
+bool pneumatic_state = false;
+
 int8_t lx;
 int8_t ly;
 int8_t rx;
 int8_t ry;
 time_t time_ps5 = {0}; // Used to integrate rx to get target angle
 time_t time_mpu6050 = {0}; // For MPU6050 PID loop
+
+int shooter_speed = 500;
+bool shooter_running = false;
 
 // Global variable to store the target angle
 float target_angle_Z = 0, angleZ = 0;
@@ -61,15 +74,19 @@ mpu6050_pid_t mpu6050_pid_params = {
 // Stepper ISR arduments, must declare as global variable
 stepper_isr_args_t stepper_isr_args = {0};
 
+mcpwm_cmpr_handle_t shooter_up = NULL, shooter_down = NULL;
+
 
 void print_debug_1(void*arg){
     pid_controller_t *pid_params = (pid_controller_t *)arg;
     // int i = 2;
     while (1)
     { 
-        // ESP_LOGI(TAG, "angleZ: %f, target_angle_Z: %f mpu output: %f M1 Output: %f", angleZ, target_angle_Z, mpu6050_pid_params.output, pid_params[0].output);
-        // ESP_LOGI(TAG, "Delta Time: %lld, Target Angle: %f AngleZ: %f", time_mpu6050.delta_time, target_angle_Z, angleZ);
+        ESP_LOGI(TAG, "angleZ: %f, target_angle_Z: %f mpu output: %f M1 Output: %f", angleZ, target_angle_Z, mpu6050_pid_params.output, pid_params[0].output);
+        // ESP_LOGI(TAG, "Delta Time: %lld, Target Angle: %f AngleZ: %f", pid_params., target_angle_Z, angleZ);
         // ESP_LOGI(TAG, "lx: %d, ly: %d, rx: %d, ry: %d target angle: %f\n", lx, ly, rx, ry, target_angle);
+        // ESP_LOGI(TAG, "Motor 1 PID Output: %f, Motor 2 PID Output: %f, Motor 3 PID Output: %f, Motor 4 PID Output: %f", pid_params[0].output, pid_params[1].output, pid_params[2].output, pid_params[3].output); 
+        // vTaskDelay(pdMS_TO_TICKS(1000)); // Delay to avoid flooding the log
     }
 }
 
@@ -91,6 +108,79 @@ void setup_shooter(void){
     stepper_add_pulses(&stepper_isr_args, 4000);
 }
 
+
+void setup_shooter_motor(mcpwm_cmpr_handle_t *shooter_up_arg, mcpwm_cmpr_handle_t *shooter_down_arg){
+    gpio_set_direction(STEPPER_DIR_PIN, GPIO_MODE_OUTPUT);
+
+    // Configure mcpwm timer
+    mcpwm_timer_handle_t shooter_timer = NULL;
+    mcpwm_timer_config_t shooter_timer_config = {
+        .group_id = SHOOTER_TIMER_GROUP, // Use timer 3, as timer 1 & 2 is already used for motor on the base
+        .clk_src = MCPWM_TIMER_CLK_SRC_PLL160M, // 160Mhz default clock source
+        .resolution_hz = TIMER_RESOLUTION,
+        .count_mode = MCPWM_TIMER_COUNT_MODE_UP_DOWN, //Count up down for symetric waveform to reduce harmonics when driving DC motors
+        .period_ticks = COUNTER_PERIOD
+    };
+
+    mcpwm_new_timer(&shooter_timer_config, &shooter_timer);
+
+    // Configure mcpwm operator
+    mcpwm_oper_handle_t shooter_operator = NULL;
+    mcpwm_operator_config_t shooter_operator_config = {
+        .group_id = SHOOTER_TIMER_GROUP,
+    };
+    mcpwm_new_operator(&shooter_operator_config, &shooter_operator);
+    mcpwm_operator_connect_timer(shooter_operator, shooter_timer);
+
+    // Configure mcpwm comparator
+    mcpwm_cmpr_handle_t shooter_up = NULL, shooter_down = NULL;
+    mcpwm_comparator_config_t comparator_config = {
+        .flags.update_cmp_on_tep = true
+    };
+    mcpwm_new_comparator(shooter_operator, &comparator_config, &shooter_up);
+    mcpwm_new_comparator(shooter_operator, &comparator_config, &shooter_down);
+
+    // Configure mcpwm generator
+    mcpwm_gen_handle_t shooter_down_generator = NULL, shooter_up_generator = NULL; 
+    
+    mcpwm_generator_config_t shooter_generator_up_config = {.gen_gpio_num = SHOOTER_MOTOR_UP_PWM};
+    mcpwm_generator_config_t shooter_generator_down_config = {.gen_gpio_num = SHOOTER_MOTOR_DOWN_PWM};
+    
+    mcpwm_new_generator(shooter_operator, &shooter_generator_up_config, &shooter_up_generator);
+    mcpwm_new_generator(shooter_operator, &shooter_generator_down_config, &shooter_down_generator);
+
+    /* 
+    Configure the correct wave characteristics to interface with motor driver
+    Dual Edge Symmetric Waveform - Active Low (Modified to active high)
+    https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/peripherals/mcpwm.html#dual-edge-symmetric-waveform-active-low
+    */ 
+    mcpwm_generator_set_actions_on_compare_event(shooter_up_generator,
+                MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, shooter_up, MCPWM_GEN_ACTION_LOW),
+                MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_DOWN, shooter_up, MCPWM_GEN_ACTION_HIGH),
+                MCPWM_GEN_COMPARE_EVENT_ACTION_END());
+    mcpwm_generator_set_actions_on_compare_event(shooter_down_generator,
+                MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, shooter_down, MCPWM_GEN_ACTION_LOW),
+                MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_DOWN, shooter_down, MCPWM_GEN_ACTION_HIGH),
+                MCPWM_GEN_COMPARE_EVENT_ACTION_END());
+
+    // Set stepper to off initially
+    mcpwm_comparator_set_compare_value(shooter_up, 0);
+    mcpwm_comparator_set_compare_value(shooter_down, 0);
+
+    mcpwm_timer_enable(shooter_timer);
+    mcpwm_timer_start_stop(shooter_timer, MCPWM_TIMER_START_NO_STOP);
+
+    *shooter_up_arg = shooter_up;
+    *shooter_down_arg = shooter_down;
+    // mcpwm_comparator_set_compare_value(stepper, STEPPER_MCPWM_COMPRATOR_MIDDLE);
+    // stepper_pulses.target_pulses = 1000;
+}
+
+void setup_pneumatic_gpio(void){
+    gpio_set_direction(PNEUMATIC_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(PNEUMATIC_PIN, 0);
+}
+
 void app_main(void)
 {
     // Declare the struct array, which contains the pwm and pcnt handler
@@ -99,23 +189,29 @@ void app_main(void)
     // Initialize 4 motors using MCPWM, no encoders version
     initialize_peripherals(pid_params); 
 
+    // Initialize Shooter Motor on GPIO 4 and 23
+    setup_shooter_motor(&shooter_up, &shooter_down);
+
     // Initialize Stepper motors MCPWM and ISR
     init_stepper(&stepper_isr_args);
 
     // Move the shooter to initial position
     setup_shooter();
 
+    // Setup pneumatic pin
+    setup_pneumatic_gpio();
+
     // If MPU6050 failed to initialize, the function will block further operations
-    // mpu6050_init();
+    mpu6050_init();
 
     // Timer with 0.5ms periodic task for MPU6050 PID update
-    // esp_timer_handle_t update_PID_mpu6050 = NULL;
-    // esp_timer_create_args_t update_PID_mpu6050_config ={
-    //     .arg = (void*)&mpu6050_pid_params,
-    //     .callback = &update_PID_mpu6060
-    // };
-    // esp_timer_create(&update_PID_mpu6050_config, &update_PID_mpu6050);
-    // esp_timer_start_periodic(update_PID_mpu6050, MPU6050_SAMPLING_US);
+    esp_timer_handle_t update_PID_mpu6050 = NULL;
+    esp_timer_create_args_t update_PID_mpu6050_config ={
+        .arg = (void*)&mpu6050_pid_params,
+        .callback = &update_PID_mpu6060
+    };
+    esp_timer_create(&update_PID_mpu6050_config, &update_PID_mpu6050);
+    esp_timer_start_periodic(update_PID_mpu6050, MPU6050_SAMPLING_US);
 
 
     // Initialize PS5 controller
@@ -135,18 +231,18 @@ void app_main(void)
 
 
     // // Setup timer with a 1ms periodic task to update PID motor speed
-    // esp_timer_handle_t timer_update_PID_motor = NULL;
-    // esp_timer_create_args_t timer_update_PID_motor_config ={
-    //     .arg = (void*)pid_params,
-    //     .callback = &update_PID_output
-    // };
-    // esp_timer_create(&timer_update_PID_motor_config, &timer_update_PID_motor);
+    esp_timer_handle_t timer_update_PID_motor = NULL;
+    esp_timer_create_args_t timer_update_PID_motor_config ={
+        .arg = (void*)pid_params,
+        .callback = &update_PID_output
+    };
+    esp_timer_create(&timer_update_PID_motor_config, &timer_update_PID_motor);
 
-    // // Start the timer
-    // esp_timer_start_periodic(timer_update_PID_motor, TIMER_PERIOD); //1ms as sampling time
+    // Start the timer
+    esp_timer_start_periodic(timer_update_PID_motor, TIMER_PERIOD); //1ms as sampling time
     
-    // // Use core 1 to print debug messages
-    // xTaskCreatePinnedToCore(&print_debug_1, "print_debug", 2048, (void*)pid_params, 1, NULL, 1);               
+    // Use core 1 to print debug messages
+    xTaskCreatePinnedToCore(&print_debug_1, "print_debug", 2048, (void*)pid_params, 1, NULL, 1);               
 
     vTaskDelay(pdMS_TO_TICKS(1000));
     while(1){
@@ -178,8 +274,11 @@ void app_main(void)
         // ESP_LOGI(TAG, "Current Speed: Negative");   
         // pid_params[2].target_speed = -0.1; 
         // vTaskDelay(pdMS_TO_TICKS(2000));
+
+        // mcpwm_comparator_set_compare_value(shooter_up, 500);
+        // mcpwm_comparator_set_compare_value(shooter_down, 500);
         
-        // vTaskDelay(portMAX_DELAY);
+        vTaskDelay(portMAX_DELAY);
     }
 
 }   
@@ -204,21 +303,61 @@ void cb ( void* arg, ps5_t ps5, ps5_event_t event) {
     if (ry <= PS5_DEADZONE && ry >= -PS5_DEADZONE) ry = 0;
 
     // Integrate the right stick to get the target angle
+    // This line is computational expensive, need to optimize
     target_angle_Z += (float)-rx * (float)time_ps5.delta_time / PS5_RX_ROTATION_RATE;
 
-    // Reset target angle if cross is pressed
+    // // Reset target angle if cross is pressed
     // if (event.button_down.cross){
     //     target_angle_Z = 0;
     // }
+
     if (event.button_down.up){
         ESP_LOGI(TAG, "Up Button Pressed");
         gpio_set_level(STEPPER_DIR_PIN, 1);
-        stepper_add_pulses(&stepper_isr_args, 3);
+        stepper_add_pulses(&stepper_isr_args, STEPPER_CLICK_STEP);
     }
     if (event.button_down.down){
         ESP_LOGI(TAG, "Up Button Pressed");
         gpio_set_level(STEPPER_DIR_PIN, 0);
-        stepper_add_pulses(&stepper_isr_args, 3);
+        stepper_add_pulses(&stepper_isr_args, STEPPER_CLICK_STEP);
+    }
+    if (event.button_down.square){
+        ESP_LOGI(TAG, "Square Button Pressed");
+        shooter_running = !shooter_running;
+        if (shooter_running){
+            mcpwm_comparator_set_compare_value(shooter_up, shooter_speed);
+            mcpwm_comparator_set_compare_value(shooter_down, shooter_speed);
+        }else{
+            mcpwm_comparator_set_compare_value(shooter_up, 0);
+            mcpwm_comparator_set_compare_value(shooter_down, 0);
+        }
+    }
+    if (event.button_down.left && shooter_running){
+        ESP_LOGI(TAG, "Left Button Pressed");
+        shooter_speed -= SHOOTER_CLICK_STEP ;
+        if (shooter_speed < 0) shooter_speed = 0;
+        mcpwm_comparator_set_compare_value(shooter_up, shooter_speed);
+        mcpwm_comparator_set_compare_value(shooter_down, shooter_speed);
+    }
+    if (event.button_down.right && shooter_running){
+        ESP_LOGI(TAG, "Right Button Pressed");
+        shooter_speed += SHOOTER_CLICK_STEP ;
+        if (shooter_speed > 1999) shooter_speed = 1999;
+        mcpwm_comparator_set_compare_value(shooter_up, shooter_speed);
+        mcpwm_comparator_set_compare_value(shooter_down, shooter_speed);
+    }
+
+    if (event.button_down.cross){
+        ESP_LOGI(TAG, "Cross Button Pressed");
+        if (pneumatic_state){
+            ESP_LOGI(TAG, "Cross Button Low");
+            gpio_set_level(PNEUMATIC_PIN, 0);
+            pneumatic_state = false;
+        }else{
+            ESP_LOGI(TAG, "Cross Button High");
+            gpio_set_level(PNEUMATIC_PIN, 1);
+            pneumatic_state = true;
+        }
     }
     
     float theta =  atan2f((float)-ly, (float)-lx);
@@ -306,7 +445,7 @@ void update_PID_output(void *arg){
             pid_params[i].output = pid_params[i].output / largest_speed * MAXIMUM_SPEED_COMPARATOR;
         }
     }
-
+    // ESP_LOGI(TAG, "Triggered");
     for(int i=0; i<4; i++){
 
         // Limit the ouput to a range within valid comparator value

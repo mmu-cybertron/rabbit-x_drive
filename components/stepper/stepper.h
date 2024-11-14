@@ -7,8 +7,8 @@
 #include "driver/gpio.h"
 #include "driver/mcpwm_prelude.h"
 
-#define STEP_PIN GPIO_NUM_4
-#define STEPPER_DIR_PIN GPIO_NUM_15
+#define STEP_PIN GPIO_NUM_33
+#define STEPPER_DIR_PIN GPIO_NUM_32
 
 #define STEPPER_BIT_MASK ((1ULL << STEPPER_DIR_PIN))
 
@@ -20,6 +20,8 @@
 #define STEPPER_MCPWM_COMPRATOR_MIDDLE 2000 // Max value for comparator
 
 #define STEPPER_TIMER_GROUP 0
+
+#define STEPPER_CLICK_STEP 6
 
 // static const char *STEPPER = "Stepper";
 
